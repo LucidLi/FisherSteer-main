@@ -23,10 +23,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from evaluate_asr import (  # noqa: E402
-    apply_precomputed_delta_hooks,
+    generate_with_pri_prefill_only as generate_fisher_prefill,
     build_inputs,
     build_layer_distance_summary,
-    build_prefill_delta_map,
     canonical_defense,
     choose_next_token,
     classify_token,
@@ -804,7 +803,7 @@ def build_eval_summary(judge_results: List[dict], args, run_dir: Path):
             "safe_FPR_by_type": type_fpr,
             "FPR_definition": (
                 "Detector-only FPR: evaluated safe prompts whose detector_triggered=True divided by all evaluated "
-                "safe prompts. PRI uses the consecutive-J prefill gate."
+                "safe prompts. FisherSteer uses the configured prefill J-token gate (default: any J)."
             ),
         }
 
@@ -841,7 +840,7 @@ def build_eval_summary(judge_results: List[dict], args, run_dir: Path):
             "FPR_by_category": category_orr,
             "FPR_definition": (
                 "Detector-only FPR: evaluated OR-Bench-Hard prompts whose detector_triggered=True divided by all "
-                "evaluated OR-Bench-Hard prompts. PRI uses the consecutive-J prefill gate."
+                "evaluated OR-Bench-Hard prompts. FisherSteer uses the configured prefill J-token gate (default: any J)."
             ),
         }
 
@@ -916,6 +915,8 @@ def prepare_pri(args, use_device_map_auto: bool):
         args.td_topk_k,
         num_layers,
         key=args.td_topk_layer_selection_key,
+        fisher_rho=artifacts["prefill_scheme"]["rho"],
+        num_tokens=args.prefill_num_tokens,
     )
     args.td_topk_k = resolved_k
     logging.info("PRI artifact dir: %s", args.artifact_dir)
@@ -1057,172 +1058,18 @@ def _print_pri_token_diagnostics(sample: dict, trace: List[dict], projection_lam
 
 
 @torch.inference_mode()
-def generate_with_pri_prefill_only(
-    model,
-    tokenizer,
-    artifacts: dict,
-    sample: dict,
-    template_name: str,
-    selected_layers: List[int],
-    prefill_num_tokens: int,
-    max_new_tokens: int,
-    do_sample: bool,
-    top_p: Optional[float],
-    detector_device: str,
-    pri_j_only: bool = True,
-    pri_j_consecutive_trigger: int = 2,
-):
-    total_start = time.perf_counter()
-    prompt = sample.get("J_prompt") or sample.get("instruction") or sample.get("H_prompt") or sample.get("prompt")
-    model_inputs = build_inputs(
-        tokenizer,
-        template_name,
-        prompt,
-        str(get_input_device(model)),
-        whitebox_attacker=is_prompt_optimized_attack(sample.get("attack", "")),
-        use_fastchat_template=uses_fastchat_template(sample.get("attack", "")),
-    )
-    filtered_inputs = filter_model_inputs_online(model, model_inputs)
-    input_ids = filtered_inputs["input_ids"].clone()
-    attention_mask = filtered_inputs.get("attention_mask")
-    attention_mask = attention_mask.clone() if attention_mask is not None else None
-    token_type_ids = filtered_inputs.get("token_type_ids")
-    token_type_ids = token_type_ids.clone() if token_type_ids is not None else None
-
-    prefill_absolute_positions, prefill_token_ids, prefill_token_texts, prefill_selection = (
-        _select_last_prefill_tokens(tokenizer, input_ids, prefill_num_tokens)
-    )
-    clean_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids, output_hidden_states=True)
-    prefill_layer_matrices = _stack_hidden_states_at_positions(clean_prefill_outputs, prefill_absolute_positions)
-
-    trace = []
-    labels = []
-    prefill_positions_info: Dict[int, dict] = {}
-    for token_index, raw_layer_matrix in enumerate(prefill_layer_matrices, start=1):
-        absolute_position = prefill_absolute_positions[token_index - 1]
-        token_text = prefill_token_texts[token_index - 1]
-        probs = classify_token(artifacts["prefill_detector"], raw_layer_matrix, detector_device)
-        labels.append(probs["pred_label"])
-
-        prefill_positions_info[absolute_position] = {
-            "token_index": int(token_index),
-            "pred_label": probs["pred_label"],
-            "apply_mitigation": False,
-        }
-        trace.append(
-            {
-                "phase": "prefill",
-                "token_index": int(token_index),
-                "absolute_position": int(absolute_position),
-                "token_id": prefill_token_ids[token_index - 1],
-                "token_text": token_text,
-                "classified": True,
-                "prefill_selection": prefill_selection,
-                "pred_label": probs["pred_label"],
-                "prob_J": probs.get("prob_J"),
-                "prob_B": probs.get("prob_B"),
-                "prob_H": probs.get("prob_H"),
-                "post_mitigation_classified": False,
-                "post_mitigation_pred_label": None,
-                "post_mitigation_prob_J": None,
-                "post_mitigation_prob_B": None,
-                "post_mitigation_prob_H": None,
-                "layer_distance_summary": [],
-            }
-        )
-
-    max_consecutive_j = _max_consecutive_j(labels)
-    required_consecutive_j = max(1, int(pri_j_consecutive_trigger))
-    prompt_level_trigger = max_consecutive_j >= required_consecutive_j
-    pri_trigger_policy = f"consecutive_J>={required_consecutive_j}"
-    mitigation_labels = {"J"} if pri_j_only else {"J", "B"}
-    token_intervention_policy = "J-only" if pri_j_only else "J-and-B"
-    if prompt_level_trigger:
-        for token_info in prefill_positions_info.values():
-            token_info["apply_mitigation"] = token_info["pred_label"] in mitigation_labels
-
-    for row in trace:
-        token_info = prefill_positions_info.get(int(row["absolute_position"]), {})
-        row["prompt_level_trigger"] = bool(prompt_level_trigger)
-        row["max_consecutive_J"] = int(max_consecutive_j)
-        row["pri_trigger_policy"] = pri_trigger_policy
-        row["pri_j_consecutive_trigger"] = int(required_consecutive_j)
-        row["pri_j_only"] = bool(pri_j_only)
-        row["token_intervention_policy"] = token_intervention_policy
-        row["apply_mitigation"] = bool(token_info.get("apply_mitigation", False))
-
-    prefill_delta_map, projection_lambda_trace = build_prefill_delta_map(
-        prefill_layer_matrices=prefill_layer_matrices,
-        prefill_positions_info=prefill_positions_info,
-        prefill_absolute_positions=prefill_absolute_positions,
-        prefill_scheme=artifacts["prefill_scheme"],
-        selected_layers=selected_layers,
-    )
-    _print_pri_token_diagnostics(sample, trace, projection_lambda_trace, selected_layers)
-
-    with apply_precomputed_delta_hooks(model, prefill_delta_map):
-        defended_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids, output_hidden_states=True)
-
-    mitigated_prefill_matrices = _stack_hidden_states_at_positions(defended_prefill_outputs, prefill_absolute_positions)
-    lambda_by_token_layer = {}
-    for record in projection_lambda_trace:
-        lambda_by_token_layer[int(record["token_index"])] = {
-            int(layer_item["layer_index"]): layer_item.get("projected_lambda")
-            for layer_item in record.get("layers", [])
-        }
-
-    for token_index, raw_layer_matrix in enumerate(mitigated_prefill_matrices, start=1):
-        post_probs = classify_token(artifacts["prefill_detector"], raw_layer_matrix, detector_device)
-        trace[token_index - 1]["post_mitigation_classified"] = True
-        trace[token_index - 1]["post_mitigation_pred_label"] = post_probs["pred_label"]
-        trace[token_index - 1]["post_mitigation_prob_J"] = post_probs.get("prob_J")
-        trace[token_index - 1]["post_mitigation_prob_B"] = post_probs.get("prob_B")
-        trace[token_index - 1]["post_mitigation_prob_H"] = post_probs.get("prob_H")
-        trace[token_index - 1]["layer_distance_summary"] = build_layer_distance_summary(
-            token_index=token_index,
-            pre_layer_matrix=prefill_layer_matrices[token_index - 1],
-            post_layer_matrix=raw_layer_matrix,
-            prefill_scheme=artifacts["prefill_scheme"],
-            selected_layers=selected_layers,
-            lambda_by_layer=lambda_by_token_layer.get(token_index, {}),
-        )
-
-    generated_token_ids: List[int] = []
-    next_token_id = choose_next_token(defended_prefill_outputs.logits[:, -1, :], do_sample=do_sample, top_p=top_p)
-    generated_token_ids.append(int(next_token_id.item()))
-    input_ids = torch.cat([input_ids, next_token_id], dim=1)
-    if attention_mask is not None:
-        attention_mask = torch.cat(
-            [attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)],
-            dim=1,
-        )
-    if token_type_ids is not None:
-        token_type_ids = torch.cat([token_type_ids, token_type_ids[:, -1:]], dim=1)
-
-    if generated_token_ids[-1] != tokenizer.eos_token_id and max_new_tokens > 1:
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "max_new_tokens": int(max_new_tokens) - 1,
-            "do_sample": do_sample,
-            "pad_token_id": tokenizer.pad_token_id,
-            "return_dict_in_generate": True,
-            "output_scores": False,
-        }
-        if attention_mask is not None:
-            gen_kwargs["attention_mask"] = attention_mask
-        if token_type_ids is not None:
-            gen_kwargs["token_type_ids"] = token_type_ids
-        if top_p is not None:
-            gen_kwargs["top_p"] = top_p
-        with apply_precomputed_delta_hooks(model, prefill_delta_map):
-            tail_output = model.generate(**filter_generate_kwargs_online(model, gen_kwargs))
-        tail_sequences = tail_output.sequences if hasattr(tail_output, "sequences") else tail_output
-        tail_ids = tail_sequences[0][input_ids.shape[1] :].tolist()
-        generated_token_ids.extend(int(x) for x in tail_ids)
-
-    generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
-    elapsed = time.perf_counter() - total_start
-    return generated_text, len(generated_token_ids), trace, elapsed, projection_lambda_trace
+def generate_with_pri_prefill_only(model, tokenizer, artifacts, sample, template_name,
+                                  selected_layers, prefill_num_tokens, max_new_tokens,
+                                  do_sample, top_p, detector_device, pri_j_only=True,
+                                  pri_j_consecutive_trigger=1):
+    start = time.perf_counter()
+    output, length, trace, lambdas = generate_fisher_prefill(
+        model, tokenizer, artifacts, sample, template_name, selected_layers,
+        prefill_num_tokens, max_new_tokens, do_sample, top_p, detector_device,
+        pri_j_only, pri_j_consecutive_trigger)
+    elapsed = time.perf_counter() - start
+    _print_pri_token_diagnostics(sample, trace, lambdas, selected_layers)
+    return output, length, trace, elapsed, lambdas
 
 
 @torch.inference_mode()
@@ -1235,7 +1082,7 @@ def detect_with_pri_prefill_only(
     prefill_num_tokens: int,
     detector_device: str,
     pri_j_only: bool = True,
-    pri_j_consecutive_trigger: int = 2,
+    pri_j_consecutive_trigger: int = 1,
 ):
     total_start = time.perf_counter()
     prompt = sample.get("J_prompt") or sample.get("instruction") or sample.get("H_prompt") or sample.get("prompt")
@@ -1520,7 +1367,7 @@ def parse_args():
     parser.add_argument("--td-topk-layer-selection-path", type=Path, default=None)
     parser.add_argument("--td-topk-layer-selection-key", type=str, default=None)
     parser.add_argument("--pri-j-only", type=str2bool, default=True, help="If true, PRI mitigates only selected prefill tokens classified as J. If false, it mitigates J and B tokens.",)
-    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=2, help="Prompt-level gate: PRI mitigation is enabled only when at least this many consecutive selected prefill tokens are classified as J.")
+    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=1, help="Optional ablation gate (paper uses 1): PRI mitigation is enabled only when at least this many consecutive selected prefill tokens are classified as J.")
 
     parser.add_argument("--skip-generation", action="store_true")
     parser.add_argument("--generation-results-path", type=Path, default=None)
@@ -1532,7 +1379,7 @@ def parse_args():
         default=None,
         help="GPT judge API key. Required for MT-Bench judging unless --disable-GPT-judge is set.",
     )
-    parser.add_argument("--judge-model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--judge-model", type=str, default="gpt-4o")
     parser.add_argument("--judge-base-url", type=str, default=None, help="Optional OpenAI-compatible judge endpoint.")
     parser.add_argument("--judge-max-tokens", type=int, default=512)
     parser.add_argument("--judge-retries", type=int, default=5)

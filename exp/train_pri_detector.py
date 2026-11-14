@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import inspect
 import json
 import random
@@ -23,8 +24,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from utils.opt_utils import load_model_and_tokenizer  # noqa: E402
-from utils.string_utils import PromptManager, load_conversation_template  # noqa: E402
+from utils.fisher import fit_fisher, rank_fisher_layers
+from utils.hidden_states import capture_decoder_outputs
+
+from evaluate_asr import (build_inputs as shared_build_inputs,
+                          load_model_and_tokenizer_for_online as shared_load_model,
+                          is_prompt_optimized_attack, uses_fastchat_template)
 
 
 EPS = 1e-12
@@ -159,6 +164,32 @@ def load_samples(dataset_path: Path):
     return retained
 
 
+def deduplicate_prompt_fields(samples):
+    """Train takes precedence; each exact input contributes once per class."""
+    seen = set()
+    kept = []
+    for sample in sorted(samples, key=lambda row: str(row.get("split", "")).lower() not in {"train", ""}):
+        row = dict(sample)
+        for label, field in LABEL_TO_FIELD.items():
+            text = row.get(field)
+            if not text:
+                continue
+            key = (label, text)
+            if key in seen:
+                row.pop(field)
+            else:
+                seen.add(key)
+        if available_labels_for_sample(row):
+            kept.append(row)
+    return kept
+
+
+def prompt_counts(samples):
+    from collections import Counter
+    return dict(Counter(f"{str(s.get('split') or 'unspecified')}:{c}"
+                        for s in samples for c in available_labels_for_sample(s)))
+
+
 def infer_template_name(model_name: str):
     name = str(model_name).lower()
     if name in {"llama2", "llama-2", "llama-2-7b-chat", "llama-2-7b-chat-hf"}:
@@ -216,17 +247,10 @@ def default_device():
     return "cpu"
 
 
-def build_inputs(tokenizer, template_name: str, prompt: str, device: str):
-    conv_template = load_conversation_template(template_name)
-    manager = PromptManager(
-        tokenizer=tokenizer,
-        conv_template=conv_template,
-        instruction=prompt,
-        verbose=False,
-        return_token_type_ids=True,
-    )
-    inputs = manager.get_inputs()
-    return {key: value.to(device) for key, value in inputs.items()}
+def build_inputs(tokenizer, template_name, prompt, device, method=""):
+    return shared_build_inputs(tokenizer, template_name, prompt, device,
+                               whitebox_attacker=is_prompt_optimized_attack(method),
+                               use_fastchat_template=uses_fastchat_template(method))
 
 
 def filter_model_inputs_online(model, model_inputs: dict):
@@ -252,32 +276,8 @@ def build_auto_max_memory(gpu_memory: str, cpu_memory: str):
     return max_memory
 
 
-def load_model_and_tokenizer_for_online(model_path: str, device: str, gpu_memory: str, cpu_memory: str):
-    use_device_map_auto = str(device).lower() == "auto"
-    if use_device_map_auto:
-        max_memory = build_auto_max_memory(gpu_memory, cpu_memory)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            use_cache=False,
-        ).eval()
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        return model, tokenizer, True
-
-    model, tokenizer = load_model_and_tokenizer(
-        str(model_path),
-        FP16=True,
-        low_cpu_mem_usage=True,
-        use_cache=False,
-        device=device,
-    )
-    return model, tokenizer, False
+def load_model_and_tokenizer_for_online(model_path, device, gpu_memory, cpu_memory):
+    return shared_load_model(model_path, device, gpu_memory, cpu_memory)
 
 
 def usable_hidden_states(outputs):
@@ -297,7 +297,7 @@ def stack_prefill_hidden_states(outputs, num_tokens: int):
         position = seq_len - token_index
         matrices.append(
             torch.stack(
-                [layer_output[0, position, :].detach().to(dtype=torch.float16).cpu() for layer_output in hidden_states],
+                [layer_output[0, position, :].detach().float().cpu() for layer_output in hidden_states],
                 dim=0,
             )
         )
@@ -318,9 +318,9 @@ def parse_args():
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--train-size", type=int, default=-1)
     parser.add_argument("--prefill-num-tokens", type=int, default=10)
-    parser.add_argument("--td-topk-m-select", type=int, default=10)
+    parser.add_argument("--td-topk-m-select", type=int, default=None)
     parser.add_argument("--td-topk-max-k", type=int, default=10)
-    parser.add_argument("--td-topk-eps", type=float, default=1e-12)
+    parser.add_argument("--td-topk-eps", type=float, default=1e-12, help="Legacy compatibility option; Fisher uses --fisher-variance-floor.")
     parser.add_argument("--artifact-root", type=Path, default=ROOT_DIR / "training_results")
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--auto-gpu-memory", type=str, default="22GiB")
@@ -335,7 +335,19 @@ def parse_args():
     parser.add_argument("--mlp-weight-decay", type=float, default=1e-4)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--progress-every", type=int, default=25)
-    return parser.parse_args()
+    parser.add_argument("--fisher-rho", type=float, default=0.1, help="Regularization strength rho (paper default: 0.1).")
+    parser.add_argument("--fisher-variance-floor", type=float, default=1e-12)
+    parser.add_argument("--fisher-device", type=str, default="cpu")
+    args = parser.parse_args()
+    if args.td_topk_m_select is None:
+        args.td_topk_m_select = args.prefill_num_tokens
+    if args.prefill_num_tokens <= 0 or args.td_topk_m_select != args.prefill_num_tokens:
+        parser.error("Paper mode requires the same positive m for detection and Fisher layer scoring.")
+    if args.td_topk_max_k <= 0:
+        parser.error("--td-topk-max-k must be positive.")
+    if not np.isfinite(args.fisher_rho) or args.fisher_rho <= 0:
+        parser.error("--fisher-rho must be positive and finite.")
+    return args
 
 
 def normalize_last_dim(x: np.ndarray):
@@ -384,8 +396,8 @@ def build_artifact_dir(args):
 
 
 @torch.inference_mode()
-def extract_one_prompt(model, tokenizer, template_name: str, prompt: str, device: str, num_tokens: int):
-    inputs = build_inputs(tokenizer, template_name, prompt, device)
+def extract_one_prompt(model, tokenizer, template_name: str, prompt: str, device: str, num_tokens: int, method=""):
+    inputs = build_inputs(tokenizer, template_name, prompt, device, method)
     forward_kwargs = {
         **inputs,
         "output_hidden_states": True,
@@ -393,7 +405,9 @@ def extract_one_prompt(model, tokenizer, template_name: str, prompt: str, device
         "use_cache": False,
     }
     filtered = filter_model_inputs_online(model, forward_kwargs)
-    outputs = model(**filtered)
+    with capture_decoder_outputs(model) as raw_states:
+        outputs = model(**filtered)
+    outputs.hidden_states = (None, *raw_states)
     return stack_prefill_hidden_states(outputs, num_tokens)
 
 
@@ -450,7 +464,7 @@ def prepare_training_examples(
                     }
                 )
             start = perf_counter()
-            matrices = extract_one_prompt(model, tokenizer, template_name, prompt_text, device, num_tokens)
+            matrices = extract_one_prompt(model, tokenizer, template_name, prompt_text, device, num_tokens, sample.get("method", "") if label == "J" else "")
             elapsed = perf_counter() - start
             completed += 1
             if progress is not None:
@@ -466,10 +480,11 @@ def prepare_training_examples(
                     flush=True,
                 )
             for token_index, layer_matrix in enumerate(matrices, start=1):
-                raw = layer_matrix.numpy().astype(np.float16, copy=False)
+                raw = layer_matrix.numpy().astype(np.float32, copy=False)
                 examples.append(
                     {
                         "sample_id": int(sample.get("id", sample_idx)),
+                        "prompt_key": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
                         "split": sample.get("split"),
                         "method": sample.get("method"),
                         "source": sample.get("source"),
@@ -506,6 +521,9 @@ def split_examples_by_declared_split(examples: List[dict]):
     ]
     if not train_examples or not val_examples:
         raise ValueError("Declared split mode requires at least one train example and one val example.")
+    if len(train_examples) + len(val_examples) != len(examples):
+        raise ValueError("Every example must declare train or val when using declared splits.")
+    validate_prompt_disjoint(train_examples, val_examples)
     train_ids = sorted({int(example["sample_id"]) for example in train_examples})
     val_ids = sorted({int(example["sample_id"]) for example in val_examples})
     return train_examples, val_examples, train_ids, val_ids, "declared_split"
@@ -519,6 +537,9 @@ def split_examples_by_sample_id(examples: List[dict], val_ratio: float, seed: in
     val_ids = set(ids[:val_count])
     train_examples = [example for example in examples if int(example["sample_id"]) not in val_ids]
     val_examples = [example for example in examples if int(example["sample_id"]) in val_ids]
+    if not train_examples or not val_examples:
+        raise ValueError("Need at least two input groups and a nonempty train/validation split.")
+    validate_prompt_disjoint(train_examples, val_examples)
     return train_examples, val_examples, sorted(set(ids) - val_ids), sorted(val_ids), "random_by_sample_id"
 
 
@@ -616,6 +637,8 @@ def train_detector(examples: List[dict], args, artifact_dir: Path):
         )
     else:
         train_examples, val_examples, train_ids, val_ids, split_mode = declared_split
+    if not 0 < args.val_ratio < 1 or args.mlp_epochs <= 0 or args.mlp_batch_size <= 0:
+        raise ValueError("Require 0 < val_ratio < 1, positive epochs and batch size.")
     first_shape = train_examples[0]["layer_matrix_raw"].shape
 
     model = PrefillMLPDetector(
@@ -677,6 +700,8 @@ def train_detector(examples: List[dict], args, artifact_dir: Path):
         "encoder_out_dim": int(args.mlp_encoder_out_dim),
         "dropout": float(args.mlp_dropout),
         "num_tokens": int(args.prefill_num_tokens),
+        "artifact_format_version": 2,
+        "hidden_state_source": "raw_decoder_block_output",
         "training_mode": "prefill_only_joint_across_tokens",
     }
     write_json(artifact_dir / "prefill_detector_meta.json", meta)
@@ -710,101 +735,12 @@ def compute_centers_raw(examples: List[dict], num_tokens: int, num_layers: int, 
     return centers
 
 
-def cosine_distance_by_layer(left: np.ndarray, right: np.ndarray, eps: float):
-    """Return cosine distance for corresponding vectors along the final axis."""
-    numerator = np.sum(left * right, axis=-1)
-    denominator = np.linalg.norm(left, axis=-1) * np.linalg.norm(right, axis=-1)
-    similarity = numerator / np.maximum(denominator, eps)
-    return np.clip(1.0 - similarity, 0.0, 2.0)
+def validate_prompt_disjoint(train, val):
+    train_keys = {e.get("prompt_key", e["sample_id"]) for e in train}
+    val_keys = {e.get("prompt_key", e["sample_id"]) for e in val}
+    if train_keys & val_keys:
+        raise ValueError("Identical prompts occur in both train and validation; fix input-level splits.")
 
-
-def compute_critical_layer_selection(
-    examples,
-    centers,
-    num_tokens: int,
-    num_layers: int,
-    m_select: int,
-    max_k: int,
-    eps: float,
-):
-    if m_select > num_tokens:
-        raise ValueError("td_topk_m_select cannot exceed prefill_num_tokens.")
-    dispersions = {label: np.zeros((m_select, num_layers), dtype=np.float64) for label in LABEL_ORDER}
-    counts = {label: np.zeros((m_select, num_layers), dtype=np.int64) for label in LABEL_ORDER}
-    for example in examples:
-        token_idx = int(example["token_index"]) - 1
-        if token_idx >= m_select:
-            continue
-        label = example["label"]
-        raw = example["layer_matrix_raw"].astype(np.float64, copy=False)
-        dispersions[label][token_idx] += cosine_distance_by_layer(
-            raw,
-            centers[label][token_idx],
-            eps,
-        )
-        counts[label][token_idx] += 1
-    for label in LABEL_ORDER:
-        dispersions[label] = dispersions[label] / np.maximum(counts[label], 1)
-
-    scores = []
-    for layer_idx in range(num_layers):
-        between = 0.0
-        within = 0.0
-        for token_idx in range(m_select):
-            h_center = centers["H"][token_idx, layer_idx]
-            j_center = centers["J"][token_idx, layer_idx]
-            b_center = centers["B"][token_idx, layer_idx]
-            h_to_j = float(cosine_distance_by_layer(h_center, j_center, eps))
-            h_to_b = float(cosine_distance_by_layer(h_center, b_center, eps))
-            between += h_to_j + h_to_b
-            within += float(
-                dispersions["J"][token_idx, layer_idx]
-                + dispersions["B"][token_idx, layer_idx]
-                + dispersions["H"][token_idx, layer_idx]
-            )
-        scores.append(
-            {
-                "layer": int(layer_idx + 1),
-                "score": float(between / (within + eps)),
-                "between_cosine_distance": float(between),
-                "within_cosine_dispersion": float(within),
-            }
-        )
-
-    ranked = sorted(scores, key=lambda item: (-item["score"], item["layer"]))
-    max_k = min(int(max_k), int(num_layers))
-    topk_layers = {}
-    topk_layers_ranked = {}
-    for k in range(1, max_k + 1):
-        selected_ranked = [int(item["layer"]) for item in ranked[:k]]
-        topk_layers[f"k={k}"] = sorted(selected_ranked)
-        topk_layers_ranked[f"k={k}"] = selected_ranked
-    return {
-        "algorithm": "PRI cosine-separation critical-layer selection",
-        "m_select": int(m_select),
-        "max_k": int(max_k),
-        "eps": float(eps),
-        "num_layers": int(num_layers),
-        "distance": "cosine_distance(u, v) = 1 - dot(u, v) / (norm(u) * norm(v))",
-        "score_definition": "sum(d_cos(mu_H,mu_J) + d_cos(mu_H,mu_B)) / (sum(sigma_J + sigma_B + sigma_H) + eps)",
-        "topk_layers": topk_layers,
-        "topk_layers_ranked_by_score": topk_layers_ranked,
-        "ranked_layers": ranked,
-        "scores_by_layer": {str(item["layer"]): item for item in scores},
-    }
-
-
-def save_center_artifacts(artifact_dir: Path, centers: Dict[str, np.ndarray]):
-    tensor_centers = {label: torch.tensor(value, dtype=torch.float32) for label, value in centers.items()}
-    torch.save(tensor_centers, artifact_dir / "prefill_token_layer_centers_raw.pt")
-    scheme = {
-        "mu_J": tensor_centers["J"],
-        "mu_B": tensor_centers["B"],
-        "mu_H": tensor_centers["H"],
-        "v_J_to_H_raw": tensor_centers["H"] - tensor_centers["J"],
-        "v_B_to_H_raw": tensor_centers["H"] - tensor_centers["B"],
-    }
-    torch.save(scheme, artifact_dir / "prefill_scheme1_center_vectors_raw.pt")
 
 
 def main():
@@ -823,9 +759,15 @@ def main():
     samples = load_samples(args.dataset_path)
     if args.train_size > 0:
         samples = samples[: args.train_size]
+    counts_before = prompt_counts(samples)
+    samples = deduplicate_prompt_fields(samples)
+    counts_after = prompt_counts(samples)
+    print(f"[Info] Exact-prompt deduplication: {counts_before} -> {counts_after}")
     args.train_size = len(samples)
     artifact_dir = build_artifact_dir(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    write_json(artifact_dir / "data_preparation.json", {"before": counts_before, "after": counts_after,
+               "policy": "exact prompt per class; train priority; original JSON unchanged"})
 
     model_path = resolve_model_path(args.model_name, args.model_path)
     template_name = infer_template_name(args.model_name)
@@ -857,24 +799,22 @@ def main():
 
     print("[Info] Training prefill MLP detector...")
     _model, meta, train_ids, val_ids, split_mode, validation_metrics = train_detector(examples, args, artifact_dir)
-    train_id_set = set(train_ids)
-    fit_examples = [example for example in examples if int(example["sample_id"]) in train_id_set]
+    if split_mode == "declared_split":
+        fit_examples = [e for e in examples if str(e.get("split", "")).lower().strip() == "train"]
+    else:
+        fit_examples = [e for e in examples if int(e["sample_id"]) in set(train_ids)]
     sample_example = examples[0]
     num_layers = int(sample_example["layer_matrix_raw"].shape[0])
     hidden_dim = int(sample_example["layer_matrix_raw"].shape[1])
 
     centers = compute_centers_raw(fit_examples, args.prefill_num_tokens, num_layers, hidden_dim)
-    save_center_artifacts(artifact_dir, centers)
-
-    td_topk = compute_critical_layer_selection(
-        examples=fit_examples,
-        centers=centers,
-        num_tokens=args.prefill_num_tokens,
-        num_layers=num_layers,
-        m_select=args.td_topk_m_select,
-        max_k=args.td_topk_max_k,
-        eps=args.td_topk_eps,
-    )
+    scheme = fit_fisher(fit_examples, centers, args.prefill_num_tokens, num_layers,
+                        rho=args.fisher_rho, variance_floor=args.fisher_variance_floor,
+                        device=args.fisher_device)
+    torch.save(scheme, artifact_dir / "prefill_scheme1_center_vectors_raw.pt")
+    torch.save({c: torch.as_tensor(v, dtype=torch.float64) for c, v in centers.items()},
+               artifact_dir / "prefill_token_layer_centers_raw.pt")
+    td_topk = rank_fisher_layers(scheme, args.td_topk_m_select, min(args.td_topk_max_k, num_layers))
     write_json(artifact_dir / f"td_topk_layer_selection_m{args.td_topk_m_select}.json", td_topk)
     torch.save(td_topk, artifact_dir / f"td_topk_layer_selection_m{args.td_topk_m_select}.pt")
 
@@ -897,6 +837,9 @@ def main():
             "prefill_num_tokens": int(args.prefill_num_tokens),
             "td_topk_m_select": int(args.td_topk_m_select),
             "td_topk_max_k": int(args.td_topk_max_k),
+            "fisher_rho": args.fisher_rho,
+            "fisher_variance_floor": args.fisher_variance_floor,
+            "hidden_state_source": "raw_decoder_block_output",
             "seed": int(args.seed),
             "progress_every": int(args.progress_every),
         },

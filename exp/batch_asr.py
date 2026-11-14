@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--prefill-num-tokens", type=int, default=None)
     parser.add_argument("--td-topk-k", type=int, default=None)
     parser.add_argument("--pri-j-only", type=str2bool, default=True)
-    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=2)
+    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=1)
     parser.add_argument("--eval-mode", type=str2bool, default=True)
     parser.add_argument("--disable-GPT-judge", action="store_true")
     parser.add_argument(
@@ -58,7 +58,7 @@ def parse_args():
         default=None,
         help="GPT judge API key forwarded to each evaluation process.",
     )
-    parser.add_argument("--judge-model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--judge-model", type=str, default="gpt-4o")
     parser.add_argument("--multi-processing", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

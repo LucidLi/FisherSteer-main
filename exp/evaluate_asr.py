@@ -19,6 +19,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+from utils.hidden_states import capture_decoder_outputs
+
 from data_registry import load_attack_samples  # noqa: E402
 from safe_eval import DictJudge, GPTJudge  # noqa: E402
 
@@ -443,17 +445,24 @@ def resolve_decoder_layers(model):
     raise AttributeError("Cannot locate decoder layers on the target model.")
 
 
-def forward_current(model, input_ids, attention_mask=None, token_type_ids=None, output_hidden_states=False):
+def forward_current(model, input_ids, attention_mask=None, token_type_ids=None, output_hidden_states=False, past_key_values=None):
     kwargs = {
         "input_ids": input_ids,
         "output_hidden_states": output_hidden_states,
         "return_dict": True,
-        "use_cache": False,
+        "use_cache": True,
     }
+    if past_key_values is not None:
+        kwargs["past_key_values"] = past_key_values
     if attention_mask is not None:
         kwargs["attention_mask"] = attention_mask
     if token_type_ids is not None:
         kwargs["token_type_ids"] = token_type_ids
+    if output_hidden_states:
+        with capture_decoder_outputs(model) as states:
+            result = model(**filter_model_inputs_online(model, kwargs))
+        result.hidden_states = (None, *states)
+        return result
     return model(**filter_model_inputs_online(model, kwargs))
 
 
@@ -488,7 +497,7 @@ def choose_next_token(logits: torch.Tensor, do_sample: bool = False, top_p: Opti
     if top_p is not None:
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative = torch.cumsum(sorted_probs, dim=-1)
-        keep = cumulative <= float(top_p)
+        keep = cumulative - sorted_probs < float(top_p)
         keep[..., 0] = True
         filtered = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
         filtered = filtered / filtered.sum(dim=-1, keepdim=True).clamp_min(EPS)
@@ -549,6 +558,19 @@ def load_artifacts(artifact_dir: Path, detector_device: str = "cpu"):
         raise FileNotFoundError(f"Missing prefill centers: {centers_path}")
 
     prefill_scheme = _as_tensor_dict(torch.load(scheme_path, map_location="cpu"), "cpu")
+    if int(prefill_scheme.get("format_version", 0)) != 2 or int(prefill_detector["meta"].get("artifact_format_version", 0)) != 2:
+        raise ValueError("Legacy PRI artifacts are incompatible with FisherSteer. Retrain with exp/train_pri_detector.py.")
+    for name in ("mu_J", "mu_B", "mu_H", "v_J_to_H_raw", "w_J_to_H", "R_HJ"):
+        if name not in prefill_scheme or not torch.isfinite(prefill_scheme[name]).all():
+            raise ValueError(f"Missing or invalid Fisher artifact: {name}")
+    rho = prefill_scheme.get("rho")
+    if rho is None or rho.numel() != 1 or not torch.isfinite(rho) or rho <= 0:
+        raise ValueError("Fisher calibration must contain a positive finite rho; recalibrate.")
+    expected = (int(prefill_detector["meta"]["num_tokens"]),
+                int(prefill_detector["meta"]["num_layers"]), int(prefill_detector["meta"]["input_dim"]))
+    for name in ("mu_J", "mu_B", "mu_H", "v_J_to_H_raw", "w_J_to_H"):
+        if tuple(prefill_scheme[name].shape) != expected:
+            raise ValueError(f"Fisher shape mismatch for {name}: expected {expected}")
     raw_centers = torch.load(centers_path, map_location="cpu")
     if not isinstance(raw_centers, dict):
         raise ValueError(f"Unsupported center artifact format: {centers_path}")
@@ -579,10 +601,17 @@ def classify_token(detector_artifact: dict, raw_layer_matrix, detector_device: s
     return result
 
 
-def compute_projection_lambda(current_hidden: torch.Tensor, target_hidden: torch.Tensor, direction_vector: torch.Tensor):
-    numerator = torch.dot((target_hidden - current_hidden).flatten(), direction_vector.flatten())
-    denominator = torch.dot(direction_vector.flatten(), direction_vector.flatten()) + EPS
-    return float((numerator / denominator).item())
+def compute_projection_lambda(current_hidden, target_hidden, direction_vector, fisher_direction):
+    current = current_hidden.double().flatten()
+    target = target_hidden.to(current.device).double().flatten()
+    v = direction_vector.to(current.device).double().flatten()
+    w = fisher_direction.to(current.device).double().flatten()
+    denominator = torch.dot(v, w)
+    if not torch.any(v != 0):
+        return 0.0
+    if not torch.isfinite(denominator) or denominator <= 0:
+        raise ValueError("Nonpositive Fisher denominator for a nonzero class mean difference.")
+    return float((torch.dot(w, target - current) / denominator).item())
 
 
 def _distance_to_center(hidden: torch.Tensor, center: torch.Tensor):
@@ -618,98 +647,71 @@ def build_layer_distance_summary(
     return rows
 
 
-def build_prefill_delta_map(
-    prefill_layer_matrices,
-    prefill_positions_info: Dict[int, dict],
-    prefill_absolute_positions: List[int],
-    prefill_scheme: dict,
-    selected_layers: List[int],
-):
-    delta_map: Dict[int, Dict[int, torch.Tensor]] = {}
-    lambda_records: List[dict] = []
-    for token_index, raw_layer_matrix in enumerate(prefill_layer_matrices, start=1):
-        absolute_position = int(prefill_absolute_positions[token_index - 1])
-        token_info = prefill_positions_info.get(absolute_position)
-        if token_info is None or not token_info.get("apply_mitigation", False):
-            continue
-
-        pred_label = token_info["pred_label"]
-        layer_records = []
-        for layer_number in selected_layers:
-            layer_idx = int(layer_number) - 1
-            current_hidden = torch.as_tensor(raw_layer_matrix[layer_idx], dtype=torch.float32)
-            projected_lambda = None
-            delta = None
-            if pred_label == "J":
-                direction_vector = prefill_scheme["v_J_to_H_raw"][token_index - 1, layer_idx].detach().float().cpu()
-                target_hidden = prefill_scheme["mu_H"][token_index - 1, layer_idx].detach().float().cpu()
-                projected_lambda = compute_projection_lambda(current_hidden, target_hidden, direction_vector)
-                delta = projected_lambda * direction_vector
-            elif pred_label == "B" and "v_B_to_H_raw" in prefill_scheme:
-                direction_vector = prefill_scheme["v_B_to_H_raw"][token_index - 1, layer_idx].detach().float().cpu()
-                target_hidden = prefill_scheme["mu_H"][token_index - 1, layer_idx].detach().float().cpu()
-                projected_lambda = compute_projection_lambda(current_hidden, target_hidden, direction_vector)
-                delta = projected_lambda * direction_vector
-
-            layer_records.append(
-                {
-                    "layer_index": int(layer_number),
-                    "projected_lambda": None if projected_lambda is None else float(projected_lambda),
-                }
-            )
-            if delta is not None:
-                delta_map.setdefault(layer_idx, {})[absolute_position] = delta.detach().cpu()
-
-        lambda_records.append(
-            {
-                "phase": "prefill",
-                "token_index": int(token_index),
-                "absolute_position": int(absolute_position),
-                "pred_label": pred_label,
-                "layers": layer_records,
-            }
-        )
-    return delta_map, lambda_records
-
-
 @contextmanager
-def apply_precomputed_delta_hooks(model, delta_map: Dict[int, Dict[int, torch.Tensor]]):
-    if not delta_map:
-        yield
-        return
-
+def apply_fisher_prefill_hooks(model, positions_info, scheme, selected_layers, records):
+    """Read each *current* block output during the second prefill, then edit it."""
     layers = resolve_decoder_layers(model)
     handles = []
-
-    def make_hook(layer_idx: int):
-        def hook(_module, _inputs, output):
-            if layer_idx not in delta_map:
-                return output
-            if isinstance(output, tuple):
-                hidden = output[0].clone()
-                tail = output[1:]
-            else:
-                hidden = output.clone()
-                tail = None
-            seq_len = hidden.shape[1]
-            current_device = hidden.device
-            for absolute_position, delta in delta_map[layer_idx].items():
-                if 0 <= int(absolute_position) < seq_len:
-                    hidden[:, int(absolute_position), :] = hidden[:, int(absolute_position), :] + delta.to(current_device)
-            if tail is None:
-                return hidden
-            return (hidden, *tail)
-
+    def make_hook(layer_number):
+        layer_idx = layer_number - 1
+        def hook(module, inputs, output):
+            hidden = (output[0] if isinstance(output, tuple) else output).clone()
+            for pos, info in positions_info.items():
+                if not info.get("apply_mitigation"):
+                    continue
+                t = info["token_index"] - 1
+                c = info["pred_label"]
+                v = scheme[f"v_{c}_to_H_raw"][t, layer_idx].to(device=hidden.device, dtype=torch.float64)
+                w = scheme[f"w_{c}_to_H"][t, layer_idx].to(device=hidden.device, dtype=torch.float64)
+                target = scheme["mu_H"][t, layer_idx].to(device=hidden.device, dtype=torch.float64)
+                before = hidden[0, pos].double()
+                lam = compute_projection_lambda(before, target, v, w)
+                after = before + lam * v
+                hidden[0, pos] = after.to(hidden.dtype)
+                record = next((r for r in records if r["token_index"] == t + 1), None)
+                if record is None:
+                    record = {"phase": "prefill", "token_index": t + 1,
+                              "absolute_position": pos, "pred_label": c, "layers": []}
+                    records.append(record)
+                record["layers"].append({"layer_index": layer_number, "projected_lambda": lam,
+                                         "projection_gap_before": float(torch.dot(w, target - before)),
+                                         "projection_gap_after": float(torch.dot(w, target - hidden[0, pos].double()))})
+            return (hidden, *output[1:]) if isinstance(output, tuple) else hidden
         return hook
-
-    for layer_idx in sorted(delta_map):
-        if 0 <= int(layer_idx) < len(layers):
-            handles.append(layers[int(layer_idx)].register_forward_hook(make_hook(int(layer_idx))))
     try:
+        for number in sorted(selected_layers):
+            if not 1 <= number <= len(layers):
+                raise ValueError(f"Invalid intervention layer {number}")
+            handles.append(layers[number - 1].register_forward_hook(make_hook(number)))
         yield
     finally:
         for handle in handles:
             handle.remove()
+
+
+@torch.inference_mode()
+def decode_from_prefill(model, tokenizer, outputs, input_ids, attention_mask,
+                        token_type_ids, max_new_tokens, do_sample, top_p):
+    """Continue the chosen prefill's KV cache with hooks already removed."""
+    if max_new_tokens <= 0:
+        return []
+    cache = outputs.past_key_values
+    if cache is None and max_new_tokens > 1:
+        raise RuntimeError("FisherSteer requires a model returning a KV cache (use_cache=True).")
+    generated = []
+    eos = getattr(model.generation_config, "eos_token_id", tokenizer.eos_token_id)
+    eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
+    for step in range(max_new_tokens):
+        token = choose_next_token(outputs.logits[:, -1, :], do_sample, top_p)
+        generated.append(int(token.item()))
+        if generated[-1] in eos or step + 1 == max_new_tokens:
+            break
+        if attention_mask is not None:
+            attention_mask = torch.cat([attention_mask, attention_mask.new_ones((1, 1))], dim=1)
+        types = token_type_ids[:, -1:] if token_type_ids is not None else None
+        outputs = forward_current(model, token, attention_mask, types, past_key_values=cache)
+        cache = outputs.past_key_values
+    return generated
 
 
 def _max_k_from_td_topk_record(record: dict):
@@ -764,8 +766,18 @@ def resolve_td_topk_selection_path(artifact_dir: Path, args, artifacts: dict):
     return candidates[0]
 
 
-def load_td_topk_selected_layers(selection_path: Path, k: Optional[int], num_layers: int, key: Optional[str] = None):
+def load_td_topk_selected_layers(selection_path: Path, k: Optional[int], num_layers: int,
+                                key: Optional[str] = None, fisher_rho=None, num_tokens=None):
     record = read_json(selection_path)
+    if record.get("format_version") != 2:
+        raise ValueError("Legacy cosine layer selection is incompatible; recalibrate FisherSteer.")
+    if int(record.get("num_layers", -1)) != num_layers:
+        raise ValueError("Layer-selection depth differs from the detector/calibration.")
+    if fisher_rho is not None and not np.isclose(float(record.get("rho", float("nan"))),
+                                               float(fisher_rho), rtol=1e-12, atol=0):
+        raise ValueError("Layer selection and intervention calibration use different rho values.")
+    if num_tokens is not None and int(record.get("m_select", -1)) != int(num_tokens):
+        raise ValueError("Layer selection and detection must use the same m; recalibrate for the requested m.")
     resolved_k = _max_k_from_td_topk_record(record) if k is None else int(k)
     resolved_key = key or f"k={resolved_k}"
     if resolved_key not in record.get("topk_layers", {}):
@@ -804,9 +816,11 @@ def generate_with_pri_prefill_only(
     top_p: Optional[float],
     detector_device: str,
     pri_j_only: bool = True,
-    pri_j_consecutive_trigger: int = 2,
+    pri_j_consecutive_trigger: int = 1,
 ):
-    """Run PRI with a consecutive-J gate and optional J-only intervention."""
+    """FisherSteer; defaults follow paper Section 3.4 (any J triggers, J-only)."""
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive.")
     prompt = sample.get("J_prompt") or sample.get("instruction") or sample.get("H_prompt") or sample.get("prompt")
     model_inputs = build_inputs(
         tokenizer,
@@ -894,18 +908,20 @@ def generate_with_pri_prefill_only(
         row["token_intervention_policy"] = token_intervention_policy
         row["apply_mitigation"] = bool(token_info.get("apply_mitigation", False))
 
-    prefill_delta_map, projection_lambda_trace = build_prefill_delta_map(
-        prefill_layer_matrices=prefill_layer_matrices,
-        prefill_positions_info=prefill_positions_info,
-        prefill_absolute_positions=prefill_absolute_positions,
-        prefill_scheme=artifacts["prefill_scheme"],
-        selected_layers=selected_layers,
-    )
-
-    with apply_precomputed_delta_hooks(model, prefill_delta_map):
-        defended_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids, output_hidden_states=True)
+    projection_lambda_trace = []
+    if any(info["apply_mitigation"] for info in prefill_positions_info.values()):
+        # Discard the clean cache. Recompute the prompt with current-state edits.
+        clean_prefill_outputs["past_key_values"] = None
+        clean_prefill_outputs["hidden_states"] = None
+        with apply_fisher_prefill_hooks(model, prefill_positions_info, artifacts["prefill_scheme"],
+                                       selected_layers, projection_lambda_trace):
+            defended_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids,
+                                                       output_hidden_states=True)
+    else:
+        defended_prefill_outputs = clean_prefill_outputs
 
     mitigated_prefill_matrices = stack_prefill_hidden_states(defended_prefill_outputs, prefill_num_tokens)
+    defended_prefill_outputs["hidden_states"] = None
     lambda_by_token_layer = {}
     for record in projection_lambda_trace:
         record["token_intervention_policy"] = token_intervention_policy
@@ -915,12 +931,6 @@ def generate_with_pri_prefill_only(
         }
 
     for token_index, raw_layer_matrix in enumerate(mitigated_prefill_matrices, start=1):
-        post_probs = classify_token(artifacts["prefill_detector"], raw_layer_matrix, detector_device)
-        trace[token_index - 1]["post_mitigation_classified"] = True
-        trace[token_index - 1]["post_mitigation_pred_label"] = post_probs["pred_label"]
-        trace[token_index - 1]["post_mitigation_prob_J"] = post_probs.get("prob_J")
-        trace[token_index - 1]["post_mitigation_prob_B"] = post_probs.get("prob_B")
-        trace[token_index - 1]["post_mitigation_prob_H"] = post_probs.get("prob_H")
         trace[token_index - 1]["layer_distance_summary"] = build_layer_distance_summary(
             token_index=token_index,
             pre_layer_matrix=prefill_layer_matrices[token_index - 1],
@@ -930,38 +940,8 @@ def generate_with_pri_prefill_only(
             lambda_by_layer=lambda_by_token_layer.get(token_index, {}),
         )
 
-    generated_token_ids: List[int] = []
-    next_token_id = choose_next_token(defended_prefill_outputs.logits[:, -1, :], do_sample=do_sample, top_p=top_p)
-    generated_token_ids.append(int(next_token_id.item()))
-    input_ids = torch.cat([input_ids, next_token_id], dim=1)
-    if attention_mask is not None:
-        attention_mask = torch.cat(
-            [attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)],
-            dim=1,
-        )
-    if token_type_ids is not None:
-        token_type_ids = torch.cat([token_type_ids, token_type_ids[:, -1:]], dim=1)
-
-    if generated_token_ids[-1] != tokenizer.eos_token_id and max_new_tokens > 1:
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "max_new_tokens": int(max_new_tokens) - 1,
-            "do_sample": do_sample,
-            "pad_token_id": tokenizer.pad_token_id,
-            "return_dict_in_generate": True,
-            "output_scores": False,
-        }
-        if attention_mask is not None:
-            gen_kwargs["attention_mask"] = attention_mask
-        if token_type_ids is not None:
-            gen_kwargs["token_type_ids"] = token_type_ids
-        if top_p is not None:
-            gen_kwargs["top_p"] = top_p
-        with apply_precomputed_delta_hooks(model, prefill_delta_map):
-            tail_output = model.generate(**filter_generate_kwargs_online(model, gen_kwargs))
-        tail_sequences = tail_output.sequences if hasattr(tail_output, "sequences") else tail_output
-        tail_ids = tail_sequences[0][input_ids.shape[1] :].tolist()
-        generated_token_ids.extend(int(x) for x in tail_ids)
+    generated_token_ids = decode_from_prefill(model, tokenizer, defended_prefill_outputs, input_ids,
+                                             attention_mask, token_type_ids, max_new_tokens, do_sample, top_p)
 
     generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
     return generated_text, len(generated_token_ids), trace, projection_lambda_trace
@@ -1087,7 +1067,7 @@ def parse_args():
     parser.add_argument("--td-topk-layer-selection-path", type=Path, default=None)
     parser.add_argument("--td-topk-layer-selection-key", type=str, default=None)
     parser.add_argument("--pri-j-only", type=str2bool, default=True)
-    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=2)
+    parser.add_argument("--pri-j-consecutive-trigger", type=int, default=1)
 
     parser.add_argument("--eval-mode", type=str2bool, default=True)
     parser.add_argument("--disable-GPT-judge", action="store_true")
@@ -1097,7 +1077,7 @@ def parse_args():
         default=None,
         help="GPT judge API key. Required unless --disable-GPT-judge is set.",
     )
-    parser.add_argument("--judge-model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--judge-model", type=str, default="gpt-4o")
     parser.add_argument("--multi-processing", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -1250,6 +1230,8 @@ def main():
         args.td_topk_k,
         num_layers,
         key=args.td_topk_layer_selection_key,
+        fisher_rho=artifacts["prefill_scheme"]["rho"],
+        num_tokens=args.prefill_num_tokens,
     )
     args.td_topk_k = resolved_k
     logging.info("PRI artifact dir: %s", args.artifact_dir)
