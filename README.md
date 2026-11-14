@@ -1,70 +1,125 @@
 # FisherSteer
 
-本仓库按 `论文初稿_中文.md` 第 3 节与附录 A.3 实现 FisherSteer。保留原 PRI 的脚本名、命令行参数和输出目录，便于继续使用已有实验入口。
+Code repository for the paper **FisherSteer: Fisher-Calibrated Activation
+Steering for LLM Jailbreak Defense**.
 
-## 代码结构
+FisherSteer is a white-box jailbreak defense that detects jailbreak-related
+hidden states during the prefill phase. It uses regularized Fisher scores to
+select intervention layers and adaptively steers the detected states toward
+the mean projection of directly harmful requests. Autoregressive decoding then
+proceeds without further detection or intervention.
 
-- `exp/train_pri_detector.py`：读取数据、提取最后 m 个输入词元的跨层状态、训练三分类 MLP、校准 Fisher 统计及选层。
-- `utils/fisher.py`：类别等权协方差、正则化线性求解、Fisher 得分与 Top-K 层选择。
-- `utils/hidden_states.py`：统一读取各 decoder block 的原始输出（最终 model norm 之前）。
-- `exp/evaluate_asr.py`：检测、条件二次预填充、逐层当前状态干预、KV 缓存续写及 ASR 评估。
-- `exp/utility_overrefusal.py`：MT-Bench、XSTest、OR-Bench；生成部分复用 ASR 的相同实现。
-- `exp/batch_asr.py`：五模型、八攻击批量入口。
-- `data/`：原始训练与评估数据；`models/`：本地模型；`training_results/`：训练产物；`results/`：评估结果。
-
-## 方法与实现
-
-MLP 对每个词元的 L×d 状态逐层做 L2 归一化，再执行 LayerNorm → Linear(d,256) → ReLU → Dropout(0.2) → Linear(256,128) → ReLU → 层均值池化 → Linear(128,64) → ReLU → Dropout(0.2) → Linear(64,3)。默认 AdamW、80 epochs、学习率 1e-3、weight decay 1e-4、batch size 16、seed 42；保存验证准确率最高的检查点。
-
-Fisher 统计使用**未归一化**的隐藏状态，分别在每个相对词元位置、每一层计算：
+## Repository layout
 
 ```text
-Sigma_c = mean_i((h_i-mu_c)(h_i-mu_c)^T)
-Sigma_W = (Sigma_J + Sigma_B + Sigma_H) / 3
-tau = trace(Sigma_W) / d
-C = Sigma_W + rho * tau * I
-v_J = mu_H - mu_J, v_B = mu_H - mu_B
-w_c = solve(C, v_c), R_Hc = v_c^T w_c
-S_l = mean_t(R_HJ[t,l] + R_HB[t,l])
+FisherSteer-main/
+├── data/                  # Training and evaluation datasets
+├── exp/                   # Training and evaluation entry points
+├── models/                # Local model weights (not tracked by Git)
+├── training_results/      # Detector and Fisher calibration artifacts
+├── results/               # Evaluation outputs
+├── mt_bench/              # MT-Bench resources
+├── peft/                  # Bundled PEFT package
+├── tests/                 # Numerical and integration tests
+└── utils/                 # Fisher, hidden-state, model, and prompt utilities
 ```
 
-使用完整协方差；样本数小于维度时用等价 Woodbury 求解，避免保存所有 d×d 矩阵。产物保存均值、v、w、R、tau、rho 和格式版本。按当前稿件第 3.2 节，rho 默认取 **0.1**；可通过 `--fisher-rho` 显式指定。仅当 tau 小于数值下限时使用 `max(tau, fisher_variance_floor)`，默认下限 1e-12。
+## Model directories
 
-首次预填充检测最后 m 个词元。默认只要有一个 J 即触发，仅修改 J 位置；未触发直接复用首次预填充缓存。触发时重新预填充，在每个选定层读取已经受前面层影响的**当前**状态 h，并执行：
+Place the target models under `models/` using the following directory names:
 
 ```text
-lambda = w^T(mu_H - h) / (v^T w)
-h' = h + lambda * v
+models/
+├── vicuna-7b-v1.5/
+├── vicuna-13b-v1.5/
+├── Llama-2-7b-chat-hf/
+├── Mistral-7B-Instruct-v0.2/
+└── Meta-Llama-3-8B-Instruct/
 ```
 
-lambda 保留正负，不裁剪。v=0 时不修改。完成后删除干预 hooks，使用选定预填充的 KV cache 正常逐词元解码。`--pri-j-consecutive-trigger 2`、`--pri-j-only false` 仍可用于消融，均偏离论文默认设置。
+The scripts also accept an explicit local path through `--model-path`.
 
-## 数据处理与兼容性
+## Installation
 
-原始 JSON 保持不变。读取后按类别和完整提示精确去重，同一提示跨 train/val 出现时优先保留 train；之后再检查两侧完整输入不重叠。`data_preparation.json` 记录去重前后各类别/划分数量。实际数量可能与论文中的描述不同，需要作者核对，代码不会生成缺失的主题匹配良性数据或虚构实验结果。
-
-MLP 与类别统计均只使用训练划分；验证划分用于检查点选择。没有声明 split 时按完整输入记录 ID 划分；所有词元共享输入归属。Base64/Zulu 继续排除。训练与推理共用模型提示构建逻辑，包括优化攻击的模板约定。
-
-**旧 PRI 检测器、余弦选层文件与欧氏投影校准产物不兼容，必须重新训练和校准。** 加载旧产物会明确报错；不会静默混用。模型层号为 1-based，t=1 为最后一个输入词元。
-
-## 安装与运行
-
-安装适合硬件的 PyTorch，然后执行 `pip install -r requirements.txt`。`models/` 支持 `vicuna-7b-v1.5`、`vicuna-13b-v1.5`、`Llama-2-7b-chat-hf`、`Mistral-7B-Instruct-v0.2`、`Meta-Llama-3-8B-Instruct`；也可传 `--model-path`。
+Create a Python environment with the CUDA-compatible PyTorch build required by
+your server, then install the remaining dependencies:
 
 ```bash
-python exp/train_pri_detector.py --model-name vicuna-7b --prefill-num-tokens 10 --td-topk-m-select 10 --td-topk-max-k 10 --fisher-rho 0.1
-python exp/evaluate_asr.py --model-name vicuna-7b --attack gcg --data-split test --num-samples 50 --td-topk-k 10 --disable-GPT-judge
-python exp/batch_asr.py --disable-GPT-judge
-python exp/utility_overrefusal.py --model-name vicuna-7b --dataset xstest --disable-GPT-judge
-python -m unittest discover -s tests -v
+pip install -r requirements.txt
 ```
 
-Fisher 校准默认在 CPU 以 float64 逐位置、逐层求解；可通过 `--fisher-device cuda:0` 指定设备，应确保显存充足。每模型需要独立训练和校准；完整高维协方差计算比旧余弦评分耗时。
+## Train and calibrate FisherSteer
 
-默认测试划分遵循原仓库留出策略，Template 使用其完整 30 条测试样本。禁用 GPT 时只运行本地拒答字符串判断，其结果不能等同论文 GPT-4o 五分制 ASR。需要外部评分时传 `--GPT_API`（默认评判模型已设为 `gpt-4o`，可用 `--judge-model` 指定）（会调用外部 API）。
+The training entry point reads the corresponding JSON file from `data/train/`
+unless `--dataset-path` is supplied. Base64 and Zulu samples are excluded.
+Exact duplicate prompts are removed before feature extraction, with training
+samples taking precedence over validation duplicates.
 
-## 验证范围
+```bash
+python exp/train_pri_detector.py \
+  --model-name vicuna-7b \
+  --prefill-num-tokens 10 \
+  --td-topk-m-select 10 \
+  --td-topk-max-k 10 \
+  --fisher-rho 0.1
+```
 
-`tests/test_fishersteer.py` 包含直接协方差求解对照（含类别数量不平衡与 Woodbury 分支）、退化情形、投影约束、多层当前状态干预、hook 清理、数据划分检查和随机初始化微型 Llama 的缓存续写测试。无需下载模型或调用 API。完整模型的 ASR、FPR、效用和时间开销需在权重与计算资源齐备后重新评估。
+Critical layers are ranked using regularized Fisher scores computed from class
+means and the equally weighted within-class covariance of jailbreak, benign,
+and directly harmful requests. The regularization strength defaults to
+`rho = 0.1`. Layer selection and detection use the same number of trailing
+input tokens.
 
-复查补充：训练特征保存为 float32，避免 CPU float32/BF16 输出被额外量化到 float16；选层和检测必须使用同一 m，加载时检查选层产物的 rho 与干预校准 rho 一致。
+Train and calibrate a separate detector for each target model. Artifacts are
+saved under `training_results/`. The evaluation scripts automatically select
+the latest training run for the requested model; use `--artifact-dir` to select
+a specific run.
+
+## ASR evaluation
+
+Run one model/attack setting:
+
+```bash
+python exp/evaluate_asr.py \
+  --model-name vicuna-7b \
+  --attack gcg \
+  --data-split test \
+  --num-samples 50 \
+  --pri-j-only true \
+  --pri-j-consecutive-trigger 1 \
+  --GPT_API YOUR_API_KEY
+```
+
+By default, any trailing input token classified as jailbreak triggers a second
+prefill pass. Only tokens classified as jailbreak are modified at the selected
+layers. If no jailbreak token is detected, generation continues from the first
+prefill pass.
+
+Run the complete five-model, eight-attack grid:
+
+```bash
+python exp/batch_asr.py --GPT_API YOUR_API_KEY
+```
+
+ASR outputs are written to `results/ASR/`. GPT-based judging uses `gpt-4o` by
+default; override it with `--judge-model`. Pass the API key explicitly with
+`--GPT_API YOUR_API_KEY`, or replace that option with `--disable-GPT-judge` to
+use local refusal-string evaluation only.
+
+The default `test` split excludes the train/validation prefix recorded by the
+dataset construction policy. `Template` therefore evaluates its complete
+30-sample held-out split even when `--num-samples 50` is used.
+
+## Utility and over-refusal evaluation
+
+```bash
+python exp/utility_overrefusal.py \
+  --model-name vicuna-7b \
+  --dataset xstest
+```
+
+Supported datasets are `mt_bench`, `xstest`, and `or-bench-hard-1k`. Outputs
+are written to `results/utility_overrefusal/`. MT-Bench judging requires
+`--GPT_API YOUR_API_KEY`; use `--disable-GPT-judge` to run without GPT-based
+judging. If FastChat cannot construct a conversation template, the evaluation
+code automatically falls back to the built-in model-specific template.
