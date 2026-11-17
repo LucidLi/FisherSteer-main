@@ -91,7 +91,14 @@ class RuntimeTests(unittest.TestCase):
         w = torch.tensor([.2, 3.], dtype=torch.float64)
         target, h = torch.tensor([1., 2.]), torch.tensor([-2., 5.])
         lam = self.runtime.compute_projection_lambda(h, target, v, w)
-        self.assertAlmostEqual(float(w @ (h + lam * v - target)), 0, places=12)
+        delta = lam * w
+        self.assertAlmostEqual(float(w @ (h + delta - target)), 0, places=12)
+        # Projection alone also admits a mean-difference update. The paper
+        # additionally requires delta in span(w) and preserves w-orthogonal states.
+        orthogonal = torch.tensor([-w[1], w[0]])
+        self.assertAlmostEqual(float(orthogonal @ delta), 0, places=12)
+        scaled = self.runtime.compute_projection_lambda(h, target, v, -7 * w)
+        torch.testing.assert_close(scaled * (-7 * w), delta)
         self.assertEqual(self.runtime.compute_projection_lambda(h, target, v * 0, w * 0), 0)
 
     def test_current_state_multilayer_hooks_and_cleanup(self):
@@ -113,6 +120,69 @@ class RuntimeTests(unittest.TestCase):
         torch.testing.assert_close(x[0, 1], torch.zeros(2))
         self.assertEqual([r["projected_lambda"] for r in records[0]["layers"]], [3., -3.])
         self.assertTrue(all(not layer._forward_hooks for layer in model.model.layers))
+
+    def test_hook_uses_fisher_direction_not_mean_difference(self):
+        layer = torch.nn.Identity()
+        model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+        v = torch.tensor([2., 1.], dtype=torch.float64)
+        w = torch.tensor([.2, 3.], dtype=torch.float64)
+        target = torch.tensor([1., 2.], dtype=torch.float64)
+        scheme = {"v_J_to_H_raw": v.reshape(1, 1, 2),
+                  "w_J_to_H": w.reshape(1, 1, 2), "mu_H": target.reshape(1, 1, 2)}
+        h = torch.tensor([[[-2., 5.], [4., 7.]]], dtype=torch.float64)
+        info = {0: {"apply_mitigation": True, "pred_label": "J", "token_index": 1}}
+        with self.runtime.apply_fisher_prefill_hooks(model, info, scheme, [1], []):
+            edited = layer(h)
+        delta = edited[0, 0] - h[0, 0]
+        self.assertAlmostEqual(float(w @ (edited[0, 0] - target)), 0, places=12)
+        self.assertAlmostEqual(float(delta @ torch.tensor([-3., .2], dtype=torch.float64)), 0, places=12)
+        torch.testing.assert_close(edited[0, 1], h[0, 1])
+        self.assertFalse(layer._forward_hooks)
+
+    def test_nonpaper_detection_policy_rejected(self):
+        for j_only, threshold in ((False, 1), (True, 2), (True, 0)):
+            with self.assertRaises(ValueError):
+                self.runtime.validate_paper_policy(j_only, threshold)
+
+    def test_seeded_heldout_sampling_and_direct_harmful_disjointness(self):
+        from data_registry import load_attack_samples
+        first = load_attack_samples("gcg", "vicuna-7b", num_samples=10, split="test", seed=42)
+        second = load_attack_samples("gcg", "vicuna-7b", num_samples=10, split="test", seed=42)
+        other = load_attack_samples("gcg", "vicuna-7b", num_samples=10, split="test", seed=7)
+        self.assertEqual([r["sample_uid"] for r in first], [r["sample_uid"] for r in second])
+        self.assertNotEqual([r["sample_uid"] for r in first], [r["sample_uid"] for r in other])
+        rows = self.train.load_samples(ROOT / "data/train/comprehensive_vicuna-7b_train.json")
+        seen = {r[f] for r in rows for f in ("J_prompt", "H_prompt", "B_prompt") if r.get(f)}
+        harmful = load_attack_samples("advbench", "vicuna-7b", split="test")
+        self.assertTrue(harmful)
+        self.assertFalse(seen & {r["instruction"] for r in first + harmful})
+
+    def test_paired_timing_entry_on_tiny_model(self):
+        import paper_experiments as experiments
+        from transformers import LlamaConfig, LlamaForCausalLM
+        model = LlamaForCausalLM(LlamaConfig(vocab_size=32, hidden_size=16,
+            intermediate_size=24, num_hidden_layers=2, num_attention_heads=2,
+            num_key_value_heads=2, eos_token_id=None, pad_token_id=0)).eval()
+        class Tokenizer:
+            eos_token_id = None
+            def decode(self, ids, **kwargs):
+                return " ".join(map(str, ids))
+        shape = (2, 2, 16)
+        artifacts = {"prefill_detector": {}, "prefill_scheme": {
+            "mu_H": torch.ones(shape), "v_J_to_H_raw": torch.ones(shape),
+            "w_J_to_H": torch.ones(shape)}}
+        context = (model, Tokenizer(), artifacts, 2, [1, 2], "cpu", "test")
+        args = SimpleNamespace(model_name="vicuna-7b", max_new_tokens=3)
+        inputs = {"input_ids": torch.tensor([[1, 2, 3, 4]])}
+        sample = {"instruction": "test", "attack": "gcg"}
+        with patch.object(self.runtime, "build_inputs", return_value=inputs), patch.object(
+                self.runtime, "classify_token", return_value={"pred_label": "J"}):
+            for defended in (False, True):
+                result = experiments.measure(args, context, sample, defended)
+                self.assertEqual(result["tokens"], 3)
+                self.assertEqual(result["triggered"], defended)
+                self.assertGreater(result["ttft_seconds"], 0)
+                self.assertLessEqual(result["ttft_seconds"], result["seconds"])
 
     def test_real_training_files_no_prompt_leakage(self):
         for path in (ROOT / "data/train").glob("*.json"):

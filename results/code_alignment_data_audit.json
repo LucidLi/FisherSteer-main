@@ -1,0 +1,33 @@
+{
+  "model_name": "vicuna-7b",
+  "dataset": "D:\\myfile\\project\\FisherSteer-main\\data\\train\\comprehensive_vicuna-7b_train.json",
+  "raw_counts": {
+    "train:J": 1703,
+    "train:B": 2303,
+    "train:H": 1703,
+    "val:J": 341,
+    "val:B": 471,
+    "val:H": 341
+  },
+  "deduplicated_counts": {
+    "train:J": 1702,
+    "train:B": 699,
+    "train:H": 403,
+    "val:J": 340,
+    "val:H": 81,
+    "val:B": 144
+  },
+  "heldout_counts": {
+    "gcg": 538,
+    "saa": 526,
+    "autodan": 538,
+    "pair": 538,
+    "drattack": 208,
+    "template": 29,
+    "deepinception": 538,
+    "sap30": 84,
+    "advbench": 208,
+    "hex_phi": 330
+  },
+  "note": "Counts reflect files on disk, not target counts asserted in the manuscript."
+}

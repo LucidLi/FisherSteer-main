@@ -6,4 +6,5 @@ torch>=2.1
 tqdm>=4.66
 transformers>=4.43,<5
 -e peft
--e mt_bench
+-e mt_benchaccelerate>=0.26
+sentencepiece>=0.1.99

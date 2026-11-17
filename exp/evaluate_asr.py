@@ -51,33 +51,10 @@ MODEL_RELATIVE_DEFAULTS = {
     "meta-llama-3-8b-instruct": Path("models") / "Meta-Llama-3-8B-Instruct",
 }
 
-class PrefillMLPDetector(nn.Module):
-    """MLP detector used by PRI for one token's cross-layer hidden states."""
-
-    def __init__(self, input_dim: int, hidden_dim: int, encoder_out_dim: int, num_classes: int, dropout: float):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, encoder_out_dim),
-            nn.ReLU(),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(encoder_out_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        encoded = self.encoder(x)
-        pooled = encoded.mean(dim=1)
-        return self.classifier(pooled)
+from utils.detector import PrefillMLPDetector
 
 
-DEFENSE_ALIASES = {"pri": "pri"}
+DEFENSE_ALIASES = {"pri": "pri", "fishersteer": "pri"}
 PROMPT_OPTIMIZED_ATTACKS = {"gcg", "autodan", "saa"}
 FASTCHAT_TEMPLATE_ATTACKS = {"gcg"}
 
@@ -601,14 +578,26 @@ def classify_token(detector_artifact: dict, raw_layer_matrix, detector_device: s
     return result
 
 
+def validate_paper_policy(j_only=True, consecutive_trigger=1):
+    if not j_only or consecutive_trigger != 1:
+        raise ValueError("FisherSteer requires J-only intervention and any J token to trigger (threshold=1).")
+
+
 def compute_projection_lambda(current_hidden, target_hidden, direction_vector, fisher_direction):
+    """Paper Section 3.4: delta=lambda*w, lambda=w.T(mu_H-h)/(w.T*w).
+
+    direction_vector is retained for callers using the old API; it is used
+    only to recognize the undefined zero-mean-difference case.
+    """
     current = current_hidden.double().flatten()
     target = target_hidden.to(current.device).double().flatten()
     v = direction_vector.to(current.device).double().flatten()
     w = fisher_direction.to(current.device).double().flatten()
-    denominator = torch.dot(v, w)
+    denominator = torch.dot(w, w)
     if not torch.any(v != 0):
         return 0.0
+    if not all(torch.isfinite(x).all() for x in (current, target, v, w)):
+        raise ValueError("Non-finite state or Fisher direction.")
     if not torch.isfinite(denominator) or denominator <= 0:
         raise ValueError("Nonpositive Fisher denominator for a nonzero class mean difference.")
     return float((torch.dot(w, target - current) / denominator).item())
@@ -657,7 +646,7 @@ def apply_fisher_prefill_hooks(model, positions_info, scheme, selected_layers, r
         def hook(module, inputs, output):
             hidden = (output[0] if isinstance(output, tuple) else output).clone()
             for pos, info in positions_info.items():
-                if not info.get("apply_mitigation"):
+                if not info.get("apply_mitigation") or info["pred_label"] != "J":
                     continue
                 t = info["token_index"] - 1
                 c = info["pred_label"]
@@ -666,7 +655,7 @@ def apply_fisher_prefill_hooks(model, positions_info, scheme, selected_layers, r
                 target = scheme["mu_H"][t, layer_idx].to(device=hidden.device, dtype=torch.float64)
                 before = hidden[0, pos].double()
                 lam = compute_projection_lambda(before, target, v, w)
-                after = before + lam * v
+                after = before + lam * w
                 hidden[0, pos] = after.to(hidden.dtype)
                 record = next((r for r in records if r["token_index"] == t + 1), None)
                 if record is None:
@@ -691,7 +680,7 @@ def apply_fisher_prefill_hooks(model, positions_info, scheme, selected_layers, r
 
 @torch.inference_mode()
 def decode_from_prefill(model, tokenizer, outputs, input_ids, attention_mask,
-                        token_type_ids, max_new_tokens, do_sample, top_p):
+                        token_type_ids, max_new_tokens, do_sample, top_p, first_token_callback=None):
     """Continue the chosen prefill's KV cache with hooks already removed."""
     if max_new_tokens <= 0:
         return []
@@ -704,6 +693,8 @@ def decode_from_prefill(model, tokenizer, outputs, input_ids, attention_mask,
     for step in range(max_new_tokens):
         token = choose_next_token(outputs.logits[:, -1, :], do_sample, top_p)
         generated.append(int(token.item()))
+        if step == 0 and first_token_callback is not None:
+            first_token_callback()
         if generated[-1] in eos or step + 1 == max_new_tokens:
             break
         if attention_mask is not None:
@@ -817,10 +808,15 @@ def generate_with_pri_prefill_only(
     detector_device: str,
     pri_j_only: bool = True,
     pri_j_consecutive_trigger: int = 1,
+    first_token_callback=None,
+    collect_diagnostics: bool = False,
 ):
     """FisherSteer; defaults follow paper Section 3.4 (any J triggers, J-only)."""
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be positive.")
+    validate_paper_policy(pri_j_only, pri_j_consecutive_trigger)
+    if not selected_layers or len(set(selected_layers)) != len(selected_layers):
+        raise ValueError("Select at least one intervention layer, without duplicates.")
     prompt = sample.get("J_prompt") or sample.get("instruction") or sample.get("H_prompt") or sample.get("prompt")
     model_inputs = build_inputs(
         tokenizer,
@@ -839,6 +835,7 @@ def generate_with_pri_prefill_only(
 
     clean_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids, output_hidden_states=True)
     prefill_layer_matrices = stack_prefill_hidden_states(clean_prefill_outputs, prefill_num_tokens)
+    clean_prefill_outputs["hidden_states"] = None
     prefill_token_ids = [
         int(input_ids[0, input_ids.shape[1] - token_index].item()) for token_index in range(1, prefill_num_tokens + 1)
     ]
@@ -916,11 +913,12 @@ def generate_with_pri_prefill_only(
         with apply_fisher_prefill_hooks(model, prefill_positions_info, artifacts["prefill_scheme"],
                                        selected_layers, projection_lambda_trace):
             defended_prefill_outputs = forward_current(model, input_ids, attention_mask, token_type_ids,
-                                                       output_hidden_states=True)
+                                                       output_hidden_states=collect_diagnostics)
     else:
         defended_prefill_outputs = clean_prefill_outputs
 
-    mitigated_prefill_matrices = stack_prefill_hidden_states(defended_prefill_outputs, prefill_num_tokens)
+    mitigated_prefill_matrices = (stack_prefill_hidden_states(defended_prefill_outputs, prefill_num_tokens)
+                                 if collect_diagnostics and prompt_level_trigger else prefill_layer_matrices)
     defended_prefill_outputs["hidden_states"] = None
     lambda_by_token_layer = {}
     for record in projection_lambda_trace:
@@ -930,7 +928,7 @@ def generate_with_pri_prefill_only(
             for layer_item in record.get("layers", [])
         }
 
-    for token_index, raw_layer_matrix in enumerate(mitigated_prefill_matrices, start=1):
+    for token_index, raw_layer_matrix in enumerate(mitigated_prefill_matrices if collect_diagnostics else [], start=1):
         trace[token_index - 1]["layer_distance_summary"] = build_layer_distance_summary(
             token_index=token_index,
             pre_layer_matrix=prefill_layer_matrices[token_index - 1],
@@ -941,7 +939,8 @@ def generate_with_pri_prefill_only(
         )
 
     generated_token_ids = decode_from_prefill(model, tokenizer, defended_prefill_outputs, input_ids,
-                                             attention_mask, token_type_ids, max_new_tokens, do_sample, top_p)
+                                             attention_mask, token_type_ids, max_new_tokens, do_sample, top_p,
+                                             first_token_callback)
 
     generated_text = tokenizer.decode(generated_token_ids, skip_special_tokens=False)
     return generated_text, len(generated_token_ids), trace, projection_lambda_trace
@@ -1184,6 +1183,7 @@ def main():
         num_samples=args.num_samples,
         dataset_path=args.dataset_path,
         split=args.data_split,
+        seed=args.seed,
     )
     if not samples:
         raise ValueError(

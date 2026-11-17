@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -167,6 +168,7 @@ def load_attack_samples(
     num_samples: Optional[int] = None,
     dataset_path: Optional[Path] = None,
     split: str = "all",
+    seed: Optional[int] = None,
 ):
     source_path = resolve_local_path(dataset_path) if dataset_path is not None else resolve_attack_path(attack, model_name)
     raw_records = _load_json(source_path)
@@ -184,6 +186,16 @@ def load_attack_samples(
     ]
     if sample_index < 0:
         raise ValueError("sample_index must be non-negative.")
+    if split_name == "test" and model_name is not None:
+        # Prefix offsets alone do not protect direct-harmful benchmarks, nor
+        # duplicate prompts occurring later in an attack source file.
+        training_path = DATA_DIR / "train" / ("comprehensive_" + model_file_for(model_name)[:-5] + "_train.json")
+        if training_path.exists():
+            seen = {r[field] for r in _load_json(training_path)
+                    for field in ("J_prompt", "B_prompt", "H_prompt") if r.get(field)}
+            samples = [s for s in samples if s["instruction"] not in seen]
+    if seed is not None:
+        random.Random(seed).shuffle(samples)
     end = None if num_samples is None or int(num_samples) < 0 else sample_index + int(num_samples)
     return samples[sample_index:end]
 

@@ -55,6 +55,10 @@ unless `--dataset-path` is supplied. Base64 and Zulu samples are excluded.
 Exact duplicate prompts are removed before feature extraction, with training
 samples taking precedence over validation duplicates.
 
+The supplied data do **not** exactly reproduce the manuscript's sample counts.
+Run the audit below before interpreting reproduction results. Source data are
+preserved; the code does not pad or relabel samples to force reported counts.
+
 ```bash
 python exp/train_pri_detector.py \
   --model-name vicuna-7b \
@@ -108,7 +112,44 @@ use local refusal-string evaluation only.
 
 The default `test` split excludes the train/validation prefix recorded by the
 dataset construction policy. `Template` therefore evaluates its complete
-30-sample held-out split even when `--num-samples 50` is used.
+remaining held-out split even when `--num-samples 50` is used. Exact prompts
+present in any calibration train/validation class are also excluded, including
+direct harmful benchmarks. Evaluation shuffles using `--seed` before selecting
+samples. Duplicate prompts can reduce the remaining count below the nominal
+count in the manuscript; the audit reports the actual sizes.
+
+The intervention is `h' = h + [w.T(mu_H-h)/(w.T*w)] w`, where
+`w = C^-1(mu_H-mu_J)`. Earlier code incorrectly updated along the mean difference
+`v`; generation and evaluation results from that implementation must be rerun.
+Compatible Fisher calibration artifacts can be reused. The old options
+`--pri-j-only` and `--pri-j-consecutive-trigger` accept only `true` and `1`.
+Legacy `pri` filenames remain for command and checkpoint compatibility.
+
+## Additional paper evaluations
+
+```bash
+python exp/paper_experiments.py audit --model-name vicuna-7b --output results/data_audit.json
+python exp/paper_experiments.py detector --model-name vicuna-7b --attack gcg,saa,autodan,pair,drattack,template,deepinception,sap30 --output results/detector.json
+python exp/paper_experiments.py overhead --model-name vicuna-7b --attack gcg --num-samples 10 --repeats 3 --output results/overhead.json
+```
+
+Detector accuracy is measured per token; benign prompt FPR is the fraction with
+at least one predicted J token. For custom benign input JSON, pass
+`--dataset-path PATH --expected-label B`. Overhead compares clean and defended
+inference on identical inputs, synchronizes CUDA, and excludes loading and
+warm-up. TTFT includes tokenization, detection and conditional re-prefill up to
+the first selected token. ATGR is the ratio of mean elapsed seconds per generated
+token; TTFT ratio is the ratio of mean first-token latency. Per-sample times and
+output lengths are retained because early stopping can differ between methods.
+The example overhead command evaluates one attack; supply a fixed balanced
+240-input set with `--dataset-path` to evaluate the paper's workload. If that
+custom file is already independently held out, add `--data-split all` to avoid
+applying the built-in attack prefix split a second time.
+
+Cross-attack training uses `--train-attack pair` to retain only PAIR J prompts
+along with all B/H prompts. Evaluate unseen attacks with the resulting explicit
+`--artifact-dir`. Use `--td-topk-k` to vary K. See
+[METHOD_ALIGNMENT.md](METHOD_ALIGNMENT.md) for scope and limitations.
 
 ## Utility and over-refusal evaluation
 

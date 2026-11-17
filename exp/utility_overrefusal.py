@@ -1085,6 +1085,8 @@ def detect_with_pri_prefill_only(
     pri_j_consecutive_trigger: int = 1,
 ):
     total_start = time.perf_counter()
+    from evaluate_asr import validate_paper_policy
+    validate_paper_policy(pri_j_only, pri_j_consecutive_trigger)
     prompt = sample.get("J_prompt") or sample.get("instruction") or sample.get("H_prompt") or sample.get("prompt")
     model_inputs = build_inputs(
         tokenizer,

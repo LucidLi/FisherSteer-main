@@ -74,30 +74,7 @@ TRAIN_DATASET_RELATIVE_DEFAULTS = {
 EXCLUDED_TRAIN_METHODS = {"base64", "zulu"}
 
 
-class PrefillMLPDetector(nn.Module):
-    """MLP detector used by PRI for one token's cross-layer hidden states."""
-
-    def __init__(self, input_dim: int, hidden_dim: int, encoder_out_dim: int, num_classes: int, dropout: float):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, encoder_out_dim),
-            nn.ReLU(),
-        )
-        self.classifier = nn.Sequential(
-            nn.Linear(encoder_out_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):
-        encoded = self.encoder(x)
-        pooled = encoded.mean(dim=1)
-        return self.classifier(pooled)
+from utils.detector import PrefillMLPDetector
 
 
 LABEL_TO_FIELD = {
@@ -267,15 +244,6 @@ def get_input_device(model):
         return torch.device("cpu")
 
 
-def build_auto_max_memory(gpu_memory: str, cpu_memory: str):
-    if not torch.cuda.is_available():
-        return None
-    max_memory = {idx: gpu_memory for idx in range(torch.cuda.device_count())}
-    if cpu_memory:
-        max_memory["cpu"] = cpu_memory
-    return max_memory
-
-
 def load_model_and_tokenizer_for_online(model_path, device, gpu_memory, cpu_memory):
     return shared_load_model(model_path, device, gpu_memory, cpu_memory)
 
@@ -314,13 +282,13 @@ def parse_args():
         help="Training JSON. Defaults to data/train/comprehensive_<model>_train.json.",
     )
     parser.add_argument("--dataset-tag", type=str, default=None)
+    parser.add_argument("--train-attack", default=None, help="Keep one J attack plus all B/H prompts for cross-attack transfer experiments.")
     parser.add_argument("--model-name", type=str, default="mistral")
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--train-size", type=int, default=-1)
     parser.add_argument("--prefill-num-tokens", type=int, default=10)
     parser.add_argument("--td-topk-m-select", type=int, default=None)
     parser.add_argument("--td-topk-max-k", type=int, default=10)
-    parser.add_argument("--td-topk-eps", type=float, default=1e-12, help="Legacy compatibility option; Fisher uses --fisher-variance-floor.")
     parser.add_argument("--artifact-root", type=Path, default=ROOT_DIR / "training_results")
     parser.add_argument("--device", type=str, default=default_device())
     parser.add_argument("--auto-gpu-memory", type=str, default="22GiB")
@@ -543,27 +511,6 @@ def split_examples_by_sample_id(examples: List[dict], val_ratio: float, seed: in
     return train_examples, val_examples, sorted(set(ids) - val_ids), sorted(val_ids), "random_by_sample_id"
 
 
-def arrays_from_examples(examples: List[dict]):
-    x = np.stack(
-        [normalize_last_dim(example["layer_matrix_raw"].astype(np.float32, copy=False)) for example in examples],
-        axis=0,
-    ).astype(np.float32, copy=False)
-    y = example_label_array(examples)
-    return x, y
-
-
-def evaluate(model, x: np.ndarray, y: np.ndarray, device: str):
-    model.eval()
-    with torch.no_grad():
-        x_tensor = torch.tensor(x, dtype=torch.float32, device=device)
-        y_tensor = torch.tensor(y, dtype=torch.long, device=device)
-        logits = model(x_tensor)
-        loss = nn.CrossEntropyLoss()(logits, y_tensor).item()
-        preds = torch.argmax(logits, dim=-1).detach().cpu().numpy()
-    acc = float(np.mean(preds == y))
-    return float(loss), acc
-
-
 def evaluate_examples(model, examples: List[dict], device: str, batch_size: int):
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="sum")
@@ -757,6 +704,18 @@ def main():
     if args.dataset_tag is None:
         args.dataset_tag = args.dataset_path.stem
     samples = load_samples(args.dataset_path)
+    if args.train_attack:
+        filtered = []
+        for sample in samples:
+            row = dict(sample)
+            if str(row.get("method", "")).lower() != args.train_attack.lower():
+                row.pop("J_prompt", None)
+            if available_labels_for_sample(row):
+                filtered.append(row)
+        if not any(r.get("J_prompt") for r in filtered):
+            raise ValueError("--train-attack matched no jailbreak prompts.")
+        samples = filtered
+        args.dataset_tag += "_" + sanitize_name(args.train_attack)
     if args.train_size > 0:
         samples = samples[: args.train_size]
     counts_before = prompt_counts(samples)
@@ -822,6 +781,7 @@ def main():
         artifact_dir / "offline_config.json",
         {
             "dataset_path": str(args.dataset_path),
+            "train_attack": args.train_attack,
             "model_name": args.model_name,
             "model_path": str(model_path),
             "default_model_relative_path": str(MODEL_RELATIVE_DEFAULTS.get(str(args.model_name).lower(), "")),
